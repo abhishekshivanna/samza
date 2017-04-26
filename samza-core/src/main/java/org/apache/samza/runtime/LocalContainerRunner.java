@@ -25,6 +25,8 @@ import org.apache.samza.application.StreamApplication;
 import org.apache.samza.config.Config;
 import org.apache.samza.config.JobConfig;
 import org.apache.samza.config.ShellCommandConfig;
+import org.apache.samza.container.ContainerHeartbeatClient;
+import org.apache.samza.container.ContainerHeartbeatMonitor;
 import org.apache.samza.container.SamzaContainer;
 import org.apache.samza.container.SamzaContainer$;
 import org.apache.samza.container.SamzaContainerExceptionHandler;
@@ -38,7 +40,6 @@ import org.apache.samza.util.ScalaToJavaUtils;
 import org.apache.samza.util.Util;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
 import java.util.HashMap;
 import java.util.Random;
 
@@ -55,6 +56,9 @@ public class LocalContainerRunner extends AbstractApplicationRunner {
   private static final Logger log = LoggerFactory.getLogger(LocalContainerRunner.class);
   private final JobModel jobModel;
   private final String containerId;
+  private ContainerHeartbeatMonitor containerHeartbeatMonitor;
+  private SamzaContainer container;
+  private static volatile boolean isContainerShutdownForced = false;
 
   public LocalContainerRunner(JobModel jobModel, String containerId) {
     super(jobModel.getConfig());
@@ -70,7 +74,7 @@ public class LocalContainerRunner extends AbstractApplicationRunner {
       ContainerModel containerModel = jobModel.getContainers().get(containerId);
       Object taskFactory = TaskFactoryUtil.createTaskFactory(config, streamApp, this);
 
-      SamzaContainer container = SamzaContainer$.MODULE$.apply(
+      container = SamzaContainer$.MODULE$.apply(
           containerModel.getProcessorId(),
           containerModel,
           config,
@@ -80,8 +84,16 @@ public class LocalContainerRunner extends AbstractApplicationRunner {
           Util.<String, MetricsReporter>javaMapAsScalaMap(new HashMap<>()),
           taskFactory);
 
+      containerHeartbeatMonitor = getContainerHeartbeatMonitor();
+      if (containerHeartbeatMonitor != null) {
+        containerHeartbeatMonitor.start();
+      }
+
       container.run();
     } finally {
+      if (containerHeartbeatMonitor != null) {
+        containerHeartbeatMonitor.stop();
+      }
       if (jmxServer != null) {
         jmxServer.stop();
       }
@@ -117,6 +129,7 @@ public class LocalContainerRunner extends AbstractApplicationRunner {
     if (jobConfig.getName().isEmpty()) {
       throw new SamzaException("can not find the job name");
     }
+
     String jobName = jobConfig.getName().get();
     String jobId = jobConfig.getJobId().getOrElse(ScalaToJavaUtils.defaultValue("1"));
     MDC.put("containerName", "samza-container-" + containerId);
@@ -125,5 +138,24 @@ public class LocalContainerRunner extends AbstractApplicationRunner {
 
     StreamApplication streamApp = TaskFactoryUtil.createStreamApplication(config);
     new LocalContainerRunner(jobModel, containerId).run(streamApp);
+    if (isContainerShutdownForced) {
+      log.info("Exiting process due to forced shutdown.");
+      System.exit(1);
+    }
+  }
+
+  private ContainerHeartbeatMonitor getContainerHeartbeatMonitor() {
+    String coordinatorUrl = System.getenv(ShellCommandConfig.ENV_COORDINATOR_URL());
+    String executionEnvContainerId = System.getenv(ShellCommandConfig.ENV_EXECUTION_ENV_CONTAINER_ID());
+    if (executionEnvContainerId != null) {
+      log.info("Got execution environment container id: {}", executionEnvContainerId);
+      return new ContainerHeartbeatMonitor(() -> {
+          container.shutdown();
+          isContainerShutdownForced = true;
+        }, new ContainerHeartbeatClient(coordinatorUrl, executionEnvContainerId));
+    } else {
+      log.warn("executionEnvContainerId not set. Container heartbeat monitor will not be started");
+      return null;
+    }
   }
 }
